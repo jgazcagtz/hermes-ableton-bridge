@@ -1,10 +1,10 @@
 # Hermes-Ableton Bridge
 
-Remote-control Ableton Live from a Hermes AI agent running on a Linux VPS, via WebSocket + Max for Live.
+Remote-control Ableton Live from a Hermes AI agent running on a Linux VPS, via WebSocket + OSC.
 
 ## What it does
 
-Hermes (on your VPS) sends commands like `play`, `set_tempo(120)`, `create_midi_clip`, `add_note`, `load_instrument("Serum")` — and Ableton Live (on your Windows PC) executes them in real time through a Max for Live device.
+Hermes (on your VPS) sends commands like `play`, `set_tempo(120)`, `create_midi_clip`, `add_note`, `load_instrument("Serum")` — and Ableton Live (on your Windows PC) executes them in real time through a Python bridge + AbletonOSC.
 
 Full control: transport, tracks, MIDI clips, notes, instruments, effects, device parameters, scenes, and live state reporting.
 
@@ -23,16 +23,23 @@ Full control: transport, tracks, MIDI clips, notes, instruments, effects, device
 ┌─────────────────────────────────────────┐
 │  WINDOWS (your PC)                      │
 │                                         │
-│  Ableton Live                           │
-│    ↕ (Max for Live API)                 │
-│  Hermes Bridge.amxd (M4L device)        │
+│  Python Bridge (ableton_osc_bridge.py)  │
 │    - WebSocket client → VPS:8080        │
-│    - JSON commands → Live API           │
+│    - JSON commands → OSC                │
 │    - State reports → VPS               │
+│    ↕ (OSC localhost)                    │
+│  AbletonOSC (M4L device in Ableton)     │
+│    - Listens on port 11000              │
+│    - Responds on port 11001            │
+│  Ableton Live                           │
 └─────────────────────────────────────────┘
 ```
 
 Key design: the WebSocket connection is **outbound from Windows** to the VPS. No ngrok, no port forwarding on your Windows machine. Just open port 8080 on the VPS firewall.
+
+The Windows side uses two components:
+1. **AbletonOSC** — a real, downloadable Max for Live device (<https://github.com/ideoforms/AbletonOSC>) that exposes the Live Object Model via OSC
+2. **Python bridge script** (`bridge/ableton_osc_bridge.py`) — translates between the VPS WebSocket protocol and AbletonOSC's OSC protocol
 
 ## Quick Start
 
@@ -57,20 +64,37 @@ Find your VPS public IP:
 curl ifconfig.me
 ```
 
-### Windows side (Ableton)
+### Windows side (Ableton + Python bridge)
 
-1. Copy the `max-for-live/` folder to your Windows machine
-2. Open Ableton Live
-3. Drag `hermes_bridge.amxd` into a MIDI track (or use Add Device → Max for Live)
-4. In the device, edit the `config` dict:
-   - `vps_host`: your VPS public IP
-   - `auth_token`: the same token you set in the server config
-   - `vps_port`: 8080
-5. Install the `ws` npm package for Node for Max:
-   - In Max: menu → Node for Max → Open Package Folder
-   - Run: `npm install ws`
-6. Click the **Connect** button in the device
-7. Check the Max console — you should see `[hermes] authenticated`
+**Step 1 — Install AbletonOSC** (Max for Live device):
+1. Download from <https://github.com/ideoforms/AbletonOSC> (Releases page → `.amxd` file)
+2. Open Ableton Live, drag the `.amxd` onto a track
+3. Verify it listens on port 11000 and responds on 11001
+
+**Step 2 — Install Python + deps**:
+```powershell
+cd C:\path\to\hermes-ableton-bridge\bridge
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+**Step 3 — Configure** (`bridge/config.yaml`):
+```yaml
+vps_host: "YOUR_VPS_PUBLIC_IP"
+auth_token: "THE_SAME_TOKEN_AS_SERVER"
+```
+
+**Step 4 — Run the bridge**:
+```powershell
+python ableton_osc_bridge.py
+```
+
+The bridge connects to the VPS automatically. You should see "Authenticated with VPS".
+
+> **Test without Ableton:** `python ableton_osc_bridge.py --dry-run` uses an in-memory mock Live set.
+
+See [`bridge/README.md`](bridge/README.md) for full bridge documentation.
 
 ### Test without Ableton (mock client)
 
@@ -99,13 +123,11 @@ uv run pytest tests/ -v
 
 ```
 hermes-ableton-bridge/
-├── max-for-live/          # Max for Live device (runs in Ableton on Windows)
-│   ├── hermes_bridge.amxd          # M4L device file (drag into Ableton)
-│   ├── hermes_bridge_inner.maxpat  # Inner patch (referenced by .amxd)
-│   ├── hermes_bridge.maxpat        # Standalone Max patch (for debugging)
-│   ├── hermes_bridge.js            # JS engine: Live API command dispatch
-│   ├── hermes_bridge_node.js       # Node for Max: WebSocket client
-│   └── package.json                # npm dep for ws package
+├── bridge/                # Python OSC bridge (runs on Windows alongside Ableton)
+│   ├── ableton_osc_bridge.py      # Main bridge script: WebSocket ↔ OSC
+│   ├── config.yaml                # Bridge configuration
+│   ├── requirements.txt           # python-osc, websockets, pyyaml
+│   └── README.md                  # Bridge setup guide
 ├── server/                # WebSocket server (runs on VPS)
 │   ├── ws_server.py                # WS :8080 + HTTP API :8081
 │   ├── config.yaml                 # Server configuration
@@ -114,6 +136,10 @@ hermes-ableton-bridge/
 │   ├── ableton_api.py              # AbletonClient — full command API
 │   ├── chord_helpers.py            # Chord progressions, drum patterns, melodies
 │   └── requirements.txt
+├── max-for-live/          # Legacy M4L device (deprecated — use bridge/ + AbletonOSC instead)
+│   ├── hermes_bridge.amxd          # Custom .amxd (Ableton refused to load hand-crafted files)
+│   ├── hermes_bridge.js            # Legacy JS engine
+│   └── hermes_bridge_node.js       # Legacy Node for Max WebSocket client
 ├── tests/                 # Testing tools
 │   ├── mock_client.py             # Simulates Ableton (no Ableton needed)
 │   ├── test_api.py                # Integration tests (20 tests)
@@ -128,6 +154,8 @@ hermes-ableton-bridge/
 ├── config.example.yaml    # Example config
 └── .gitignore
 ```
+
+> **Note:** The `max-for-live/` folder contains the deprecated custom `.amxd` approach that didn't work (Ableton doesn't accept hand-crafted JSON as a valid device file). Use `bridge/` + AbletonOSC instead.
 
 ## Quick API example
 
@@ -162,13 +190,13 @@ client.launch_scene(0)
 
 - All WebSocket connections require a shared secret token (first message auth)
 - The HTTP API listens on localhost only (127.0.0.1) by default
-- For WAN SSL, enable SSL in the server config and use `wss://` in the M4L device
+- For WAN SSL, enable SSL in the server config and set `use_ssl: true` in the bridge `config.yaml`
 - Never commit your real auth token to git
 
 ## Requirements
 
 - **VPS**: Python 3.11+, websockets, aiohttp, pyyaml
-- **Windows**: Ableton Live 11+ with Max for Live, Node.js (for Node for Max)
+- **Windows**: Ableton Live 11+ with Max for Live, Python 3.8+, python-osc, websockets, pyyaml, and the AbletonOSC device installed
 - **Network**: VPS port 8080 open (TCP inbound)
 
 ## License

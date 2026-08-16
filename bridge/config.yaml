@@ -1,0 +1,33 @@
+# Hermes-Ableton OSC Bridge — configuration
+# ===========================================
+# This file is read by ableton_osc_bridge.py on the Windows PC.
+# Command-line args and environment variables override these values.
+#
+# Environment variables:
+#   BRIDGE_VPS_HOST, BRIDGE_VPS_PORT, BRIDGE_AUTH_TOKEN,
+#   BRIDGE_OSC_HOST, BRIDGE_OSC_SEND_PORT, BRIDGE_OSC_LISTEN_PORT,
+#   BRIDGE_STATE_INTERVAL
+
+# VPS WebSocket server (the bridge connects here as a client)
+vps_host: "177.7.34.85"
+vps_port: 8080
+auth_token: "change-me-please"     # MUST match the server's auth_token
+use_ssl: false                      # set true if the VPS uses wss://
+
+# AbletonOSC (Max for Live device inside Ableton)
+osc_host: "127.0.0.1"              # AbletonOSC runs on localhost
+osc_send_port: 11000               # AbletonOSC listens here (we send TO it)
+osc_listen_port: 11001             # AbletonOSC sends responses here (we listen ON it)
+
+# State polling — how often (seconds) to query Ableton and report state to VPS
+state_interval: 2.0
+
+# OSC response timeout (seconds). Should be less than the server's command_timeout.
+osc_timeout: 5.0
+
+# WebSocket auto-reconnect backoff (seconds)
+reconnect_base_delay: 1
+reconnect_max_delay: 30
+
+# Logging
+log_level: "INFO"                  # DEBUG, INFO, WARNING, ERROR
