@@ -1,0 +1,30 @@
+# Hermes-Ableton Bridge — Example Configuration
+# Copy to server/config.local.yaml and edit values.
+# Environment variables override these:
+#   BRIDGE_AUTH_TOKEN, BRIDGE_WS_PORT, BRIDGE_HTTP_PORT
+
+# WebSocket server (Ableton connects here from Windows)
+ws_host: "0.0.0.0"
+ws_port: 8080
+
+# HTTP API (Hermes agent calls this on localhost)
+http_host: "127.0.0.1"
+http_port: 8081
+
+# Shared secret — generate one:
+#   python3 -c "import secrets; print(secrets.token_hex(32))"
+auth_token: "change-me-please"
+
+# Seconds to wait for a command response from Ableton
+command_timeout: 10.0
+
+# Seconds between state reports from Ableton
+state_interval: 2.0
+
+log_level: "INFO"
+
+# SSL for WAN encryption (recommended for production)
+ssl:
+  enabled: false
+  cert: ""    # path to PEM cert
+  key: ""     # path to PEM key

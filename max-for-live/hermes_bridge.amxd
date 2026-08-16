@@ -1,0 +1,23 @@
+{
+  "patcher": {
+    "id": "hermes_bridge_amxd",
+    "rect": [100, 100, 800, 600],
+    "bgcolor": [0.18, 0.18, 0.22, 1.0],
+    "editing_bgcolor": [0.15, 0.15, 0.2, 1.0],
+    "boxes": [
+      {
+        "box": {
+          "id": "device_wrapper",
+          "maxclass": "live.device",
+          "varname": "device",
+          "patching_rect": [10, 10, 780, 580],
+          "filename": "hermes_bridge_inner.maxpat"
+        }
+      }
+    ],
+    "lines": [],
+    "parameters": {
+      "parameter_overrides": []
+    }
+  }
+}
