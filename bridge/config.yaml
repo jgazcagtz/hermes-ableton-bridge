@@ -10,7 +10,7 @@
 
 # VPS WebSocket server (the bridge connects here as a client)
 vps_host: "177.7.34.85"
-vps_port: 8080
+vps_port: 8443
 auth_token: "change-me-please"     # MUST match the server's auth_token
 use_ssl: false                      # set true if the VPS uses wss://
 
