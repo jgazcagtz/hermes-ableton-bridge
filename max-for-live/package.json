@@ -4,6 +4,6 @@
   "description": "Node for Max WebSocket client for Hermes Bridge",
   "private": true,
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.21.3"
   }
 }
