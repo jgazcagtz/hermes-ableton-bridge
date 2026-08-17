@@ -31,3 +31,4 @@ reconnect_max_delay: 30
 
 # Logging
 log_level: "INFO"                  # DEBUG, INFO, WARNING, ERROR
+
