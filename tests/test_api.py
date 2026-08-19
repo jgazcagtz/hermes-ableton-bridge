@@ -72,7 +72,8 @@ async def test_transport_commands(client):
         await _call(client, "play"); assert True
         assert (await _call(client, "set_tempo", 128))["tempo"] == 128
         assert (await _call(client, "stop")).get("playing") is False
-        assert (await _call(client, "toggle_metronome")).get("metronome") is True
+        assert (await _call(client, "record", True)).get("overdub") is True
+        assert (await _call(client, "toggle_loop", True)).get("loop") is True
     finally:
         mock_task.cancel()
         await control["stop"]()
@@ -88,8 +89,11 @@ async def test_track_management(client):
         await _call(client, "set_pan", 1, 0.25)
         await _call(client, "mute_track", 1, True)
         await _call(client, "solo_track", 0, False)
-        st = await _call(client, "get_state")
-        assert st["connected"] is True
+        st = await _call(client, "ableton_status")
+        assert "state" in st
+        assert st["state"].get("tracks")
+        timing = await _call(client, "get_timing")
+        assert "tempo" in timing
     finally:
         mock_task.cancel()
         await control["stop"]()
@@ -100,12 +104,22 @@ async def test_clips_and_notes(client):
     control, mock_task = await _boot()
     try:
         await _call(client, "create_midi_clip", track=0, length_beats=4.0)
-        await _call(client, "add_note", track=0, clip=0, pitch=60, start=0.0, duration=0.5, velocity=100)
-        await _call(client, "add_notes", track=0, clip=0, notes=[(64, 0.5, 0.5, 90), (67, 1.0, 0.5, 80)])
+        await _call(
+            client,
+            "replace_clip_notes",
+            track=0,
+            clip=0,
+            notes=[
+                (60, 0.0, 0.5, 100),
+                (64, 0.5, 0.5, 90),
+                (67, 1.0, 0.5, 80),
+            ],
+        )
         st = await _call(client, "get_full_state")
-        track0 = st["tracks"][0]
+        track0 = st["state"]["tracks"][0]
         assert len(track0["clips"]) >= 1
         assert len(track0["clips"][0]["notes"]) >= 3
+        assert (await _call(client, "clear_clip", 0, 0, True)).get("cleared") is True
     finally:
         mock_task.cancel()
         await control["stop"]()
@@ -115,11 +129,14 @@ async def test_clips_and_notes(client):
 async def test_devices_and_browser(client):
     control, mock_task = await _boot()
     try:
-        await _call(client, "load_instrument", track=0, name="Serum")
-        await _call(client, "load_effect", track=0, name="Reverb")
-        params = await _call(client, "get_device_parameters", track=0, device=0)
-        assert isinstance(params.get("parameters"), list)
-        await _call(client, "set_device_parameter", track=0, device=0, param=0, value=0.7)
+        with pytest.raises(AbletonError):
+            await _call(client, "load_instrument", track=0, name="Serum")
+        with pytest.raises(AbletonError):
+            await _call(client, "load_effect", track=0, name="Reverb")
+        with pytest.raises(AbletonError):
+            await _call(client, "get_device_parameters", track=0, device=0)
+        with pytest.raises(AbletonError):
+            await _call(client, "set_device_parameter", track=0, device=0, param=0, value=0.7)
     finally:
         mock_task.cancel()
         await control["stop"]()
@@ -129,9 +146,11 @@ async def test_devices_and_browser(client):
 async def test_scenes(client):
     control, mock_task = await _boot()
     try:
-        await _call(client, "create_scene", "Intro")
+        with pytest.raises(AbletonError):
+            await _call(client, "create_scene", "Intro")
         await _call(client, "launch_scene", 0)
-        await _call(client, "reorder_scene", 0, 1)
+        with pytest.raises(AbletonError):
+            await _call(client, "reorder_scene", 0, 1)
     finally:
         mock_task.cancel()
         await control["stop"]()
@@ -169,9 +188,9 @@ def test_invalid_tempo():
 def test_invalid_note_pitch():
     c = AbletonClient(host="127.0.0.1", port=1, token="x")
     with pytest.raises(ValueError):
-        c.add_note(track=0, clip=0, pitch=200, start=0, duration=1, velocity=100)
+        c.replace_clip_notes(track=0, clip=0, notes=[(200, 0, 0.5, 100)])
     with pytest.raises(ValueError):
-        c.add_notes(track=0, clip=0, notes=[(60, 0, 0.5, 200)])
+        c.replace_clip_notes(track=0, clip=0, notes=[(60, 0, 0.5, 200)])
 
 
 # --------------------------------------------------------------------------- #
@@ -197,7 +216,7 @@ def test_create_chord_progression():
     actions = [x[0] for x in c.calls]
     assert "set_tempo" in actions
     assert "create_midi_clip" in actions
-    assert "add_notes" in actions
+    assert "replace_clip_notes" in actions
 
 
 def test_create_drum_pattern():

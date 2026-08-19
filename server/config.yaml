@@ -10,7 +10,7 @@ http_port: 8081
 
 # Shared secret. The Max for Live device MUST send {"auth": "<token>"} as its
 # first message. Keep this secret — anyone with it can control your Ableton.
-auth_token: "change-me-please"
+auth_token: ""                     # must be set via env/config before start
 
 # Seconds to wait for a command response from Ableton before timing out.
 command_timeout: 10.0

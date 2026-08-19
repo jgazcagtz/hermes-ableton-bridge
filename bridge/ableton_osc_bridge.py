@@ -69,6 +69,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import sys
 import time
 import uuid
@@ -88,14 +89,14 @@ except ImportError:  # pragma: no cover
 try:
     from pythonosc.udp_client import SimpleUDPClient
     from pythonosc.dispatcher import Dispatcher
-    from pythonosc.osc_server import AsyncOSCUDPServer
+    from pythonosc.osc_server import AsyncIOOSCUDPServer
 
     PYTHONOSC_AVAILABLE = True
 except ImportError:  # pragma: no cover
     PYTHONOSC_AVAILABLE = False
     SimpleUDPClient = None  # type: ignore[assignment,misc]
     Dispatcher = None  # type: ignore[assignment,misc]
-    AsyncOSCUDPServer = None  # type: ignore[assignment,misc]
+    AsyncIOOSCUDPServer = None  # type: ignore[assignment,misc]
 
 LOG = logging.getLogger("ableton-bridge")
 
@@ -113,6 +114,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "log_level": "INFO",
     "use_ssl": False,
 }
+
+
+def _require_token(cfg: Dict[str, Any]) -> None:
+    token = str(cfg.get("auth_token", "")).strip()
+    if not token or token == "change-me-please":
+        raise RuntimeError(
+            "auth_token must be set to a runtime-loaded value, not the placeholder."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +163,8 @@ class MockAbleton:
             },
         ]
         self.scenes: List[Dict[str, Any]] = [{"index": 0, "name": "Scene 1"}]
+        self._beat_position = 0.0
+        self._beat_clock = time.time()
 
     def _track(self, index: int) -> Dict[str, Any]:
         for t in self.tracks:
@@ -161,17 +172,30 @@ class MockAbleton:
                 return t
         raise IndexError(f"no track at index {index}")
 
+    def _tick(self) -> None:
+        now = time.time()
+        if self.playing:
+            elapsed_seconds = max(0.0, now - self._beat_clock)
+            self._beat_position += (elapsed_seconds / 60.0) * float(self.tempo)
+        self._beat_clock = now
+
+    def _set_playing(self, on: bool) -> None:
+        self._tick()
+        self.playing = bool(on)
+
     def _reindex(self) -> None:
         for i, t in enumerate(self.tracks):
             t["index"] = i
 
     def full_state(self) -> Dict[str, Any]:
+        self._tick()
         return {
             "tempo": self.tempo,
             "playing": self.playing,
             "loop": self.loop_on,
             "metronome": self.metronome,
             "overdub": self.overdub_on,
+            "beat_position": self._beat_position,
             "time_signature": list(self.time_signature),
             "tracks": self.tracks,
             "scenes": self.scenes,
@@ -179,11 +203,11 @@ class MockAbleton:
 
     # -- transport --
     def play(self) -> Dict[str, Any]:
-        self.playing = True
+        self._set_playing(True)
         return {"playing": True}
 
     def stop(self) -> Dict[str, Any]:
-        self.playing = False
+        self._set_playing(False)
         return {"playing": False}
 
     def set_tempo(self, bpm: float) -> Dict[str, Any]:
@@ -196,6 +220,10 @@ class MockAbleton:
 
     def toggle_loop(self) -> Dict[str, Any]:
         self.loop_on = not self.loop_on
+        return {"loop": self.loop_on}
+
+    def set_loop(self, on: bool) -> Dict[str, Any]:
+        self.loop_on = bool(on)
         return {"loop": self.loop_on}
 
     def toggle_metronome(self) -> Dict[str, Any]:
@@ -325,6 +353,20 @@ class MockAbleton:
         t["clips"][int(clip)]["notes"] = []
         return {"cleared": True}
 
+    def replace_clip_notes(self, track: int, clip: int, notes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        t = self._track(int(track))
+        c = t["clips"][int(clip)]
+        c["notes"] = [
+            {
+                "pitch": int(n["pitch"]),
+                "start": float(n["start"]),
+                "duration": float(n["duration"]),
+                "velocity": int(n["velocity"]),
+            }
+            for n in notes
+        ]
+        return {"replaced": len(c["notes"])}
+
     def quantize_clip(self, track: int, clip: int, grid: int = 4) -> Dict[str, Any]:
         t = self._track(int(track))
         c = t["clips"][int(clip)]
@@ -338,6 +380,24 @@ class MockAbleton:
         c = t["clips"][int(clip)]
         c["loop"] = not c.get("loop", True)
         return {"loop": c["loop"]}
+
+    def set_clip_loop(self, track: int, clip: int, loop: bool) -> Dict[str, Any]:
+        t = self._track(int(track))
+        c = t["clips"][int(clip)]
+        c["loop"] = bool(loop)
+        return {"loop": c["loop"]}
+
+    def launch_clip(self, track: int, clip: int) -> Dict[str, Any]:
+        t = self._track(int(track))
+        c = t["clips"][int(clip)]
+        c["is_playing"] = True
+        return {"launched": True, "track": t["index"], "clip": int(clip)}
+
+    def stop_clip(self, track: int, clip: int) -> Dict[str, Any]:
+        t = self._track(int(track))
+        c = t["clips"][int(clip)]
+        c["is_playing"] = False
+        return {"stopped": True, "track": t["index"], "clip": int(clip)}
 
     # -- browser --
     def load_instrument(self, track: int, name: str) -> Dict[str, Any]:
@@ -431,6 +491,14 @@ class OSCResponder:
         LOG.debug("Unmatched OSC response: %s %s", address, arg_list)
 
     async def wait_for(self, address: str, timeout: float) -> Optional[List[Any]]:
+        for index, (received_address, args) in enumerate(self._unmatched):
+            if (
+                received_address == address
+                or received_address.endswith(address)
+                or address.endswith(received_address)
+            ):
+                self._unmatched.pop(index)
+                return args
         fut = asyncio.get_event_loop().create_future()
         self._pending.setdefault(address, []).append(fut)
         try:
@@ -469,6 +537,7 @@ class AbletonOSCBridge:
         # OSC state
         self.osc_client: Optional[Any] = None          # SimpleUDPClient
         self.osc_server: Optional[Any] = None          # AsyncOSCUDPServer
+        self.osc_transport: Optional[Any] = None       # asyncio UDP transport
         self.responder = OSCResponder()
 
         # Control
@@ -511,10 +580,10 @@ class AbletonOSCBridge:
         if self.dry_run or self.osc_client is None:
             return
         loop = asyncio.get_event_loop()
-        self.osc_server = AsyncOSCUDPServer(
+        self.osc_server = AsyncIOOSCUDPServer(
             self._osc_listen_addr, self._osc_dispatcher, loop
         )
-        await self.osc_server.serve()
+        self.osc_transport, _ = await self.osc_server.create_serve_endpoint()
         LOG.info("OSC server listening on %s:%d", *self._osc_listen_addr)
 
     def _on_osc(self, address: str, *args: Any) -> None:
@@ -533,14 +602,18 @@ class AbletonOSCBridge:
         self.osc_client.send_message(address, args or [])
         LOG.debug("→ OSC %s %s", address, args or [])
 
-    async def _osc_get(self, address: str,
-                       timeout: Optional[float] = None) -> Optional[List[Any]]:
-        """Send a GET (no args) and wait for the response."""
+    async def _osc_get(
+        self,
+        address: str,
+        args: Optional[List[Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Optional[List[Any]]:
+        """Send a GET and wait for the response on the same OSC address."""
         if self.dry_run:
-            LOG.info("[DRY-RUN] OSC GET %s", address)
+            LOG.info("[DRY-RUN] OSC GET %s %s", address, args or [])
             return None
         to = timeout if timeout is not None else self.config["osc_timeout"]
-        self._send(address)
+        self._send(address, args)
         return await self.responder.wait_for(address, to)
 
     async def _osc_set(self, address: str, value: Any,
@@ -611,6 +684,9 @@ class AbletonOSCBridge:
             except asyncio.TimeoutError:
                 pass
 
+        if self.osc_transport is not None:
+            self.osc_transport.close()
+            self.osc_transport = None
         LOG.info("Bridge shutting down.")
 
     async def _connect_and_serve(self) -> None:
@@ -624,8 +700,13 @@ class AbletonOSCBridge:
         uri = f"{scheme}://{host}:{port}"
 
         LOG.info("Connecting to %s ...", uri)
-        async with websockets.connect(uri, ping_interval=20, ping_timeout=20,
-                                       close_timeout=10) as ws:
+        async with websockets.connect(
+            uri,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+            family=socket.AF_INET,
+        ) as ws:
             self.ws = ws
             self._ws_connected = True
 
@@ -723,106 +804,105 @@ class AbletonOSCBridge:
     # ------------------------------------------------------------------ #
     # --- Transport ---
     async def _cmd_play(self, p: Dict[str, Any]) -> Dict[str, Any]:
-        await self._osc_call_fallback(
-            ["/live_set/start_play", "/live_set/play"],
-            wait=True,
-        )
+        await self._osc_call("/live/song/start_playing", wait=False)
         return {"playing": True}
 
     async def _cmd_stop(self, p: Dict[str, Any]) -> Dict[str, Any]:
-        await self._osc_call_fallback(
-            ["/live_set/stop_play", "/live_set/stop"],
-            wait=True,
-        )
+        await self._osc_call("/live/song/stop_playing", wait=False)
         return {"playing": False}
 
     async def _cmd_set_tempo(self, p: Dict[str, Any]) -> Dict[str, Any]:
-        bpm = float(p["tempo"])
-        await self._osc_set("/live_set/tempo", bpm)
+        bpm = float(p["tempo"] if "tempo" in p else p["bpm"])
+        await self._osc_set("/live/song/set/tempo", bpm)
         return {"tempo": bpm}
 
     async def _cmd_set_time_signature(self, p: Dict[str, Any]) -> Dict[str, Any]:
         num = int(p["numerator"])
         den = int(p["denominator"])
-        await self._osc_set("/live_set/signature_numerator", num)
-        await self._osc_set("/live_set/signature_denominator", den)
+        await self._osc_set("/live/song/set/signature_numerator", num)
+        await self._osc_set("/live/song/set/signature_denominator", den)
         return {"time_signature": [num, den]}
 
     async def _cmd_toggle_loop(self, p: Dict[str, Any]) -> Dict[str, Any]:
-        resp = await self._osc_get("/live_set/loop")
+        resp = await self._osc_get("/live/song/get/loop")
         cur = bool(resp[0]) if resp else False
-        await self._osc_set("/live_set/loop", 0 if cur else 1)
+        await self._osc_set("/live/song/set/loop", 0 if cur else 1)
         return {"loop": not cur}
 
+    async def _cmd_set_loop(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        if "on" not in p:
+            raise ValueError("set_loop requires on")
+        on = bool(p["on"])
+        await self._osc_set("/live/song/set/loop", 1 if on else 0)
+        return {"loop": on}
+
     async def _cmd_toggle_metronome(self, p: Dict[str, Any]) -> Dict[str, Any]:
-        resp = await self._osc_get("/live_set/metronome")
+        resp = await self._osc_get("/live/song/get/metronome")
         cur = bool(resp[0]) if resp else False
-        await self._osc_set("/live_set/metronome", 0 if cur else 1)
+        await self._osc_set("/live/song/set/metronome", 0 if cur else 1)
         return {"metronome": not cur}
 
     async def _cmd_overdub(self, p: Dict[str, Any]) -> Dict[str, Any]:
         if "on" in p and p["on"] is not None:
             on = bool(p["on"])
         else:
-            resp = await self._osc_get("/live_set/overdub")
+            resp = await self._osc_get("/live/song/get/arrangement_overdub")
             on = not (bool(resp[0]) if resp else False)
-        await self._osc_set("/live_set/overdub", 1 if on else 0)
+        await self._osc_set("/live/song/set/arrangement_overdub", 1 if on else 0)
         return {"overdub": on}
 
     # --- Tracks ---
     async def _cmd_create_midi_track(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = p.get("index")
-        args = [int(idx)] if idx is not None else []
-        await self._osc_call("/live_set/create_midi_track", args, wait=True)
+        target = int(idx) if idx is not None else -1
+        await self._osc_call("/live/song/create_midi_track", [target], wait=False)
         return {"track": int(idx) if idx is not None else 0}
 
     async def _cmd_create_audio_track(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = p.get("index")
-        args = [int(idx)] if idx is not None else []
-        await self._osc_call("/live_set/create_audio_track", args, wait=True)
+        target = int(idx) if idx is not None else -1
+        await self._osc_call("/live/song/create_audio_track", [target], wait=False)
         return {"track": int(idx) if idx is not None else 0}
 
     async def _cmd_delete_track(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = int(p["index"])
-        await self._osc_call("/live_set/delete_track", [idx], wait=True)
+        await self._osc_call("/live/song/delete_track", [idx], wait=False)
         return {"deleted": idx}
 
     async def _cmd_duplicate_track(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = int(p["index"])
-        await self._osc_call("/live_set/duplicate_track", [idx], wait=True)
+        await self._osc_call("/live/song/duplicate_track", [idx], wait=False)
         return {"duplicated": idx}
 
     async def _cmd_mute_track(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = int(p["index"])
         mute = 1 if p.get("mute", True) else 0
-        await self._osc_set(f"{_track_path(idx)}/mute", mute)
+        self._send("/live/track/set/mute", [idx, mute])
         return {"track": idx, "mute": bool(mute)}
 
     async def _cmd_solo_track(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = int(p["index"])
         solo = 1 if p.get("solo", True) else 0
-        await self._osc_set(f"{_track_path(idx)}/solo", solo)
+        self._send("/live/track/set/solo", [idx, solo])
         return {"track": idx, "solo": bool(solo)}
 
     async def _cmd_set_volume(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = int(p["index"])
         vol = float(p["volume"])
-        await self._osc_set(f"{_track_path(idx)}/volume", vol)
+        self._send("/live/track/set/volume", [idx, vol])
         return {"track": idx, "volume": vol}
 
     async def _cmd_set_pan(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = int(p["index"])
         pan = float(p["pan"])
-        await self._osc_set(f"{_track_path(idx)}/pan", pan)
+        self._send("/live/track/set/panning", [idx, pan])
         return {"track": idx, "pan": pan}
 
     async def _cmd_set_send(self, p: Dict[str, Any]) -> Dict[str, Any]:
         idx = int(p["index"])
         send = int(p["send"])
         value = float(p["value"])
-        # Primary path: /live_set/tracks/{i}/sends/{s}  (AbletonOSC convention)
-        # Fallback: /live_set/tracks/{i}/sends/{s}/value
-        await self._osc_set(f"{_track_path(idx)}/sends/{send}", value)
+        self._send("/live/track/set/send", [idx, send, value])
         return {"track": idx, "send": send, "value": value}
 
     # --- Clips ---
@@ -830,10 +910,10 @@ class AbletonOSCBridge:
         track = int(p["track"])
         length = float(p.get("length_beats", 4.0))
         slot = int(p["scene"]) if "scene" in p and p["scene"] is not None else 0
-        # AbletonOSC: /live_set/tracks/{t}/clip_slots/{slot}/create_clip [length]
         await self._osc_call(
-            f"/live_set/tracks/{track}/clip_slots/{slot}/create_clip",
-            [length], wait=True,
+            "/live/clip_slot/create_clip",
+            [track, slot, length],
+            wait=False,
         )
         return {"track": track, "clip": slot, "scene": slot, "length_beats": length}
 
@@ -841,7 +921,7 @@ class AbletonOSCBridge:
         track = int(p["track"])
         clip = int(p["clip"])
         length = float(p["length_beats"])
-        await self._osc_set(f"{_clip_path(track, clip)}/loop_end", length)
+        self._send("/live/clip/set/loop_end", [track, clip, length])
         return {"length_beats": length}
 
     async def _cmd_add_note(self, p: Dict[str, Any]) -> Dict[str, Any]:
@@ -851,13 +931,10 @@ class AbletonOSCBridge:
         start = float(p["start"])
         duration = float(p["duration"])
         velocity = int(p.get("velocity", 100))
-        # AbletonOSC: add_notes takes [pitch, start, duration, velocity, muted]
-        # Some versions use /add_notes, others /notes/add — try both.
-        base = _clip_path(track, clip)
-        await self._osc_call_fallback(
-            [f"{base}/add_notes", f"{base}/notes/add"],
-            [pitch, start, duration, velocity, 0],
-            wait=True,
+        await self._osc_call(
+            "/live/clip/add/notes",
+            [track, clip, pitch, start, duration, velocity, False],
+            wait=False,
         )
         return {"added": True}
 
@@ -865,18 +942,56 @@ class AbletonOSCBridge:
         track = int(p["track"])
         clip = int(p["clip"])
         notes = p["notes"]
-        base = _clip_path(track, clip)
         for n in notes:
             pitch = int(n["pitch"])
             start = float(n["start"])
             duration = float(n["duration"])
             velocity = int(n.get("velocity", 100))
-            await self._osc_call_fallback(
-                [f"{base}/add_notes", f"{base}/notes/add"],
-                [pitch, start, duration, velocity, 0],
-                wait=True,
+            self._send(
+                "/live/clip/add/notes",
+                [track, clip, pitch, start, duration, velocity, False],
             )
         return {"added": len(notes)}
+
+    async def _cmd_replace_clip_notes(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        track = int(p["track"])
+        clip = int(p["clip"])
+        notes = p.get("notes", [])
+        await self._cmd_clear_clip({"track": track, "clip": clip})
+        for n in notes:
+            payload = {
+                "track": track,
+                "clip": clip,
+                "pitch": int(n["pitch"]),
+                "start": float(n["start"]),
+                "duration": float(n["duration"]),
+                "velocity": int(n.get("velocity", 100)),
+            }
+            await self._cmd_add_note(payload)
+        return {"replaced": len(notes)}
+
+    async def _cmd_set_clip_loop(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        track = int(p["track"])
+        clip = int(p["clip"])
+        loop = bool(p["loop"])
+        # Try modern AbletonOSC path first, then legacy path for compatibility.
+        self._send("/live/clip/set/loop", [track, clip, 1 if loop else 0])
+        self._send(f"{_clip_path(track, clip)}/looping", [1 if loop else 0])
+        return {"loop": loop}
+
+    async def _cmd_launch_clip(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        track = int(p["track"])
+        clip = int(p["clip"])
+        self._send("/live/clip/launch", [track, clip])
+        self._send(f"{_clip_path(track, clip)}/fire")
+        return {"launched": True, "track": track, "clip": clip}
+
+    async def _cmd_stop_clip(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        track = int(p["track"])
+        clip = int(p["clip"])
+        self._send("/live/clip/stop", [track, clip])
+        self._send(f"{_clip_path(track, clip)}/stop")
+        return {"stopped": True, "track": track, "clip": clip}
 
     async def _cmd_remove_note(self, p: Dict[str, Any]) -> Dict[str, Any]:
         track = int(p["track"])
@@ -977,49 +1092,47 @@ class AbletonOSCBridge:
         device = int(p["device"])
         param = int(p["param"])
         value = float(p["value"])
-        path = f"{_device_path(track, device)}/parameters/{param}"
-        # Primary: set the "value" child property
-        # Fallback: set directly on the parameter path
-        await self._osc_set(f"{path}/value", value)
+        self._send(
+            "/live/device/set/parameter/value",
+            [track, device, param, value],
+        )
         return {"value": value}
 
     async def _cmd_get_device_parameters(self, p: Dict[str, Any]) -> Dict[str, Any]:
         track = int(p["track"])
         device = int(p["device"])
-        dev_path = _device_path(track, device)
-
-        # Get parameter count — AbletonOSC returns count when querying
-        # /live_set/tracks/{t}/devices/{d}/parameters  with no args
-        count_resp = await self._osc_get(f"{dev_path}/parameters")
-        if count_resp and isinstance(count_resp[0], (int, float)):
-            count = int(count_resp[0])
-        else:
-            count = 8  # fallback default
-
-        params: List[Dict[str, Any]] = []
-        for i in range(count):
-            name_resp = await self._osc_get(f"{dev_path}/parameters/{i}/name")
-            val_resp = await self._osc_get(f"{dev_path}/parameters/{i}/value")
-            params.append({
-                "name": name_resp[0] if name_resp else f"Param {i}",
-                "value": val_resp[0] if val_resp else 0.0,
-            })
+        name_resp = await self._osc_get(
+            "/live/device/get/parameters/name", [track, device]
+        )
+        value_resp = await self._osc_get(
+            "/live/device/get/parameters/value", [track, device]
+        )
+        names = name_resp[2:] if name_resp else []
+        values = value_resp[2:] if value_resp else []
+        count = max(len(names), len(values))
+        params: List[Dict[str, Any]] = [
+            {
+                "name": names[i] if i < len(names) else f"Param {i}",
+                "value": values[i] if i < len(values) else 0.0,
+            }
+            for i in range(count)
+        ]
         return {"parameters": params}
 
     # --- Scenes ---
     async def _cmd_create_scene(self, p: Dict[str, Any]) -> Dict[str, Any]:
         name = p.get("name", "")
         # Get current scene count to insert at the end
-        count_resp = await self._osc_get("/live_set/scenes")
+        count_resp = await self._osc_get("/live/song/get/num_scenes")
         count = int(count_resp[0]) if count_resp else 0
-        await self._osc_call("/live_set/create_scene", [count], wait=True)
+        await self._osc_call("/live/song/create_scene", [count], wait=False)
         if name:
-            await self._osc_set(f"/live_set/scenes/{count}/name", name)
+            self._send("/live/scene/set/name", [count, name])
         return {"scene": count}
 
     async def _cmd_launch_scene(self, p: Dict[str, Any]) -> Dict[str, Any]:
         scene = int(p["scene"])
-        await self._osc_call(f"/live_set/scenes/{scene}/launch", wait=True)
+        await self._osc_call("/live/scene/fire", [scene], wait=False)
         return {"launched": scene}
 
     async def _cmd_reorder_scene(self, p: Dict[str, Any]) -> Dict[str, Any]:
@@ -1035,7 +1148,7 @@ class AbletonOSCBridge:
     # ------------------------------------------------------------------ #
     #  State querying (real OSC)
     # ------------------------------------------------------------------ #
-    async def _query_full_state(self) -> Dict[str, Any]:
+    async def _query_full_state_legacy(self) -> Dict[str, Any]:
         """Query the full Live set state via OSC. Returns a dict matching the
         protocol's state report format."""
         state: Dict[str, Any] = {
@@ -1193,6 +1306,122 @@ class AbletonOSCBridge:
 
         return state
 
+    async def _query_full_state(self) -> Dict[str, Any]:
+        """Query state using the current ideoforms/AbletonOSC API."""
+
+        async def get(
+            address: str, args: Optional[List[Any]] = None
+        ) -> Optional[List[Any]]:
+            try:
+                return await self._osc_get(address, args=args)
+            except Exception:  # noqa: BLE001
+                return None
+
+        async def scalar(
+            address: str,
+            args: Optional[List[Any]] = None,
+            default: Any = None,
+        ) -> Any:
+            response = await get(address, args)
+            return response[-1] if response else default
+
+        beat_pos = await scalar("/live/song/get/beat_time", default=None)
+        if beat_pos is None:
+            beat_pos = await scalar(
+                "/live/song/get/current_song_time", default=0.0
+            )
+
+        state: Dict[str, Any] = {
+            "tempo": float(await scalar("/live/song/get/tempo", default=120.0)),
+            "playing": bool(await scalar("/live/song/get/is_playing", default=False)),
+            "loop": bool(await scalar("/live/song/get/loop", default=False)),
+            "metronome": bool(
+                await scalar("/live/song/get/metronome", default=False)
+            ),
+            "overdub": bool(
+                await scalar(
+                    "/live/song/get/arrangement_overdub", default=False
+                )
+            ),
+            "beat_position": float(beat_pos),
+            "time_signature": [
+                int(
+                    await scalar(
+                        "/live/song/get/signature_numerator", default=4
+                    )
+                ),
+                int(
+                    await scalar(
+                        "/live/song/get/signature_denominator", default=4
+                    )
+                ),
+            ],
+            "tracks": [],
+            "scenes": [],
+        }
+
+        track_count = int(
+            await scalar("/live/song/get/num_tracks", default=0)
+        )
+        track_names = await get("/live/song/get/track_names") or []
+        for index in range(track_count):
+            has_midi_input = bool(
+                await scalar(
+                    "/live/track/get/has_midi_input", [index], default=False
+                )
+            )
+            device_response = await get(
+                "/live/track/get/devices/name", [index]
+            ) or []
+            device_names = device_response[1:] if device_response else []
+            state["tracks"].append(
+                {
+                    "index": index,
+                    "name": (
+                        str(track_names[index])
+                        if index < len(track_names)
+                        else f"Track {index + 1}"
+                    ),
+                    "type": "midi" if has_midi_input else "audio",
+                    "volume": float(
+                        await scalar(
+                            "/live/track/get/volume", [index], default=0.0
+                        )
+                    ),
+                    "pan": float(
+                        await scalar(
+                            "/live/track/get/panning", [index], default=0.0
+                        )
+                    ),
+                    "mute": bool(
+                        await scalar(
+                            "/live/track/get/mute", [index], default=False
+                        )
+                    ),
+                    "solo": bool(
+                        await scalar(
+                            "/live/track/get/solo", [index], default=False
+                        )
+                    ),
+                    "clips": [],
+                    "devices": [
+                        {"index": device_index, "name": str(name), "parameters": []}
+                        for device_index, name in enumerate(device_names)
+                    ],
+                }
+            )
+
+        scene_count = int(
+            await scalar("/live/song/get/num_scenes", default=0)
+        )
+        for index in range(scene_count):
+            name = await scalar(
+                "/live/scene/get/name", [index], default=f"Scene {index + 1}"
+            )
+            state["scenes"].append({"index": index, "name": str(name)})
+
+        return state
+
     # ------------------------------------------------------------------ #
     #  State polling loop
     # ------------------------------------------------------------------ #
@@ -1245,11 +1474,15 @@ class AbletonOSCBridge:
         if action == "stop":
             return m.stop()
         if action == "set_tempo":
-            return m.set_tempo(p["tempo"])
+            return m.set_tempo(p["tempo"] if "tempo" in p else p["bpm"])
         if action == "set_time_signature":
             return m.set_time_signature(p["numerator"], p["denominator"])
         if action == "toggle_loop":
             return m.toggle_loop()
+        if action == "set_loop":
+            if "on" not in p:
+                raise ValueError("set_loop requires on")
+            return m.set_loop(p["on"])
         if action == "toggle_metronome":
             return m.toggle_metronome()
         if action == "overdub":
@@ -1285,10 +1518,22 @@ class AbletonOSCBridge:
                 p["duration"], p.get("velocity", 100))
         if action == "add_notes":
             return m.add_notes(p["track"], p["clip"], p["notes"])
+        if action == "replace_clip_notes":
+            return m.replace_clip_notes(
+                int(p["track"]), int(p["clip"]), p.get("notes", [])
+            )
         if action == "remove_note":
             return m.remove_note(p["track"], p["clip"], p["pitch"], p["start"])
         if action == "clear_clip":
             return m.clear_clip(p["track"], p["clip"])
+        if action == "set_clip_loop":
+            if "loop" not in p:
+                raise ValueError("set_clip_loop requires loop")
+            return m.set_clip_loop(p["track"], p["clip"], p["loop"])
+        if action == "launch_clip":
+            return m.launch_clip(p["track"], p["clip"])
+        if action == "stop_clip":
+            return m.stop_clip(p["track"], p["clip"])
         if action == "quantize_clip":
             return m.quantize_clip(p["track"], p["clip"], p.get("grid", 4))
         if action == "toggle_clip_loop":
@@ -1417,6 +1662,11 @@ def main() -> None:
 
     cfg = load_config(config_path)
     cfg = merge_cli_args(cfg, args)
+    try:
+        _require_token(cfg)
+    except RuntimeError:
+        # Make token hard-fail explicit in one place for security posture.
+        raise
 
     logging.basicConfig(
         level=getattr(logging, str(cfg.get("log_level", "INFO")).upper(), logging.INFO),
@@ -1425,7 +1675,8 @@ def main() -> None:
 
     LOG.info("=" * 60)
     LOG.info("Hermes-Ableton OSC Bridge")
-    LOG.info("  VPS:        ws://%s:%d", cfg["vps_host"], cfg["vps_port"])
+    scheme = "wss" if cfg.get("use_ssl") else "ws"
+    LOG.info("  VPS:        %s://%s:%d", scheme, cfg["vps_host"], cfg["vps_port"])
     LOG.info("  OSC send:    %s:%d", cfg["osc_host"], cfg["osc_send_port"])
     LOG.info("  OSC listen:  %s:%d", cfg["osc_host"], cfg["osc_listen_port"])
     LOG.info("  State poll:  every %.1fs", cfg["state_interval"])
@@ -1460,12 +1711,26 @@ def main() -> None:
             # Windows doesn't support add_signal_handler — use KeyboardInterrupt fallback
             pass
 
+    main_task = loop.create_task(bridge.run())
     try:
-        loop.run_until_complete(bridge.run())
+        loop.run_until_complete(main_task)
     except KeyboardInterrupt:
         LOG.info("Interrupted by user.")
     finally:
         bridge.stop()
+
+        async def _shutdown() -> None:
+            if bridge.ws is not None:
+                await bridge.ws.close()
+            if not main_task.done():
+                main_task.cancel()
+            await asyncio.gather(main_task, return_exceptions=True)
+            if bridge.osc_transport is not None:
+                bridge.osc_transport.close()
+                bridge.osc_transport = None
+            await asyncio.sleep(0)
+
+        loop.run_until_complete(_shutdown())
         loop.close()
 
 

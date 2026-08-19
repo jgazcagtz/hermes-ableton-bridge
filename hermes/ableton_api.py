@@ -2,34 +2,16 @@
 Hermes-Ableton Bridge — Python API for the Hermes agent
 =======================================================
 
-Clean synchronous API the Hermes agent calls to control Ableton Live remotely.
-All methods talk to the bridge's HTTP API on the VPS (default localhost:8081),
-which forwards commands over the WebSocket to the Max for Live device in Ableton.
-
-Example
--------
-    from hermes.ableton_api import AbletonClient
-
-    client = AbletonClient(host="localhost", port=8081, token="secret")
-    client.play()
-    client.set_tempo(120)
-    client.create_midi_track()
-    client.create_midi_clip(track=0, length_beats=4)
-    client.add_note(track=0, clip=0, pitch=60, start=0.0, duration=0.5, velocity=100)
-    state = client.get_state()
-
-The token here is the SAME token configured in server/config.yaml and inside the
-Max for Live device — it is used for the HTTP -> WS forwarding path. The actual
-WebSocket auth (Ableton -> server) uses the same shared secret.
+Curated v1 HTTP client that talks to the VPS server through the explicit
+`/command` tool schema.
 """
 
 from __future__ import annotations
 
 import json
-import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 class AbletonError(Exception):
@@ -50,8 +32,7 @@ class AbletonClient:
     port : int
         HTTP API port (default 8081).
     token : str
-        Shared secret (must match server config and the M4L device). Currently
-        kept for future HTTP auth; forwarded as a header.
+        Shared secret that must match server config and the bridge token.
     timeout : float
         Per-request HTTP timeout in seconds.
     """
@@ -62,36 +43,48 @@ class AbletonClient:
         self.token = token
         self.timeout = timeout
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     #  Low-level HTTP
-    # ------------------------------------------------------------------ #
-    def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    def _post(self, path: str, payload: Dict[str, Any],
+              idempotency_key: Optional[str] = None) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "X-Bridge-Token": self.token,
+        }
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         req = urllib.request.Request(
-            url, data=data, method="POST",
-            headers={"Content-Type": "application/json",
-                     "X-Bridge-Token": self.token},
+            url,
+            data=data,
+            method="POST",
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
+        except urllib.error.HTTPError as e:  # pragma: no cover - exercised by integration tests
             try:
                 body = json.loads(e.read().decode("utf-8"))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 body = {"error": str(e)}
             msg = body.get("error", str(e))
             if e.code == 503:
                 raise AbletonNotConnectedError(msg)
+            if e.code == 401:
+                raise AbletonError(f"bridge auth failed: {msg}")
             raise AbletonError(msg)
-        except urllib.error.URLError as e:
+        except urllib.error.URLError as e:  # pragma: no cover
             raise AbletonError(f"cannot reach bridge at {url}: {e.reason}")
 
     def _get(self, path: str) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         req = urllib.request.Request(
-            url, method="GET", headers={"X-Bridge-Token": self.token},
+            url,
+            method="GET",
+            headers={"X-Bridge-Token": self.token},
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -99,217 +92,348 @@ class AbletonClient:
         except urllib.error.HTTPError as e:
             try:
                 body = json.loads(e.read().decode("utf-8"))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 body = {"error": str(e)}
             raise AbletonError(body.get("error", str(e)))
         except urllib.error.URLError as e:
             raise AbletonError(f"cannot reach bridge at {url}: {e.reason}")
 
-    def _command(self, action: str, **params: Any) -> Dict[str, Any]:
-        """Send a command and return the response `data` (or raise on error)."""
-        resp = self._post("/command", {"action": action, "params": params})
+    def _command(self, tool: str, mode: Optional[str] = "execute",
+                 idempotency_key: Optional[str] = None,
+                 **params: Any) -> Dict[str, Any]:
+        payload = {"tool": tool, "params": params}
+        if mode is not None:
+            payload["mode"] = mode
+        resp = self._post("/command", payload, idempotency_key=idempotency_key)
         if resp.get("status") != "ok":
             raise AbletonError(resp.get("error") or "unknown error")
         return resp.get("data", {}) or {}
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    #  Utility
+    # ------------------------------------------------------------------
+    def _validate_range(self, name: str, value: float, min_value: float,
+                       max_value: float) -> float:
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be numeric")
+        if value < min_value or value > max_value:
+            raise ValueError(f"{name} must be between {min_value} and {max_value}")
+        return float(value)
+
+    def _validate_note_list(self, notes: Sequence[Any]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for index, note in enumerate(notes):
+            if isinstance(note, dict):
+                pitch = note.get("pitch")
+                start = note.get("start")
+                duration = note.get("duration")
+                velocity = note.get("velocity", 100)
+            else:
+                if len(note) < 4:
+                    raise ValueError(
+                        f"note[{index}] must be (pitch,start,duration,velocity)"
+                    )
+                pitch, start, duration, velocity = note[0], note[1], note[2], note[3]
+
+            if not isinstance(pitch, (int, float)) or not 0 <= int(pitch) <= 127:
+                raise ValueError(f"note[{index}].pitch must be 0..127")
+            if not isinstance(velocity, (int, float)) or not 0 <= int(velocity) <= 127:
+                raise ValueError(f"note[{index}].velocity must be 0..127")
+            if not isinstance(start, (int, float)) or start < 0:
+                raise ValueError(f"note[{index}].start must be >= 0")
+            if not isinstance(duration, (int, float)) or duration < 0:
+                raise ValueError(f"note[{index}].duration must be >= 0")
+
+            normalized.append({
+                "pitch": int(pitch),
+                "start": float(start),
+                "duration": float(duration),
+                "velocity": int(velocity),
+            })
+        return normalized
+
+    # ------------------------------------------------------------------
     #  Connection / status
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     def status(self) -> Dict[str, Any]:
         return self._get("/status")
 
     def is_connected(self) -> bool:
         return bool(self.status().get("ableton_connected"))
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     #  Transport
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    def transport(self, action: str, on: Optional[bool] = None) -> Dict[str, Any]:
+        action = str(action).strip().lower()
+        if action not in {"play", "stop", "loop", "record"}:
+            raise ValueError("action must be play|stop|loop|record")
+        payload: Dict[str, Any] = {"action": action}
+        if action == "loop" and on is not None:
+            payload["on"] = bool(on)
+        if action == "record":
+            if on is None:
+                raise ValueError("record requires on=True|False")
+            payload["on"] = bool(on)
+        return self._command("ableton_transport", **payload)
+
     def play(self) -> Dict[str, Any]:
-        return self._command("play")
+        return self.transport("play")
 
     def stop(self) -> Dict[str, Any]:
-        return self._command("stop")
+        return self.transport("stop")
+
+    def toggle_loop(self, on: bool) -> Dict[str, Any]:
+        return self.transport("loop", on=bool(on))
+
+    def record(self, on: bool) -> Dict[str, Any]:
+        return self.transport("record", on=bool(on))
 
     def set_tempo(self, bpm: float) -> Dict[str, Any]:
-        if not 20 <= bpm <= 999:
-            raise ValueError("tempo must be between 20 and 999 BPM")
-        return self._command("set_tempo", tempo=float(bpm))
+        bpm_v = self._validate_range("tempo", bpm, 20.0, 999.0)
+        return self._command("ableton_set_tempo", tempo=bpm_v)
 
-    def set_time_signature(self, numerator: int, denominator: int) -> Dict[str, Any]:
-        if denominator not in (1, 2, 4, 8, 16):
-            raise ValueError("denominator must be 1,2,4,8 or 16")
-        return self._command("set_time_signature",
-                              numerator=int(numerator), denominator=int(denominator))
+    def get_timing(self) -> Dict[str, Any]:
+        return self._command("ableton_get_timing", mode="query")
 
-    def toggle_loop(self) -> Dict[str, Any]:
-        return self._command("toggle_loop")
-
-    def toggle_metronome(self) -> Dict[str, Any]:
-        return self._command("toggle_metronome")
-
-    def overdub(self, on: Optional[bool] = None) -> Dict[str, Any]:
-        params = {}
-        if on is not None:
-            params["on"] = bool(on)
-        return self._command("overdub", **params)
-
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     #  Tracks
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    def create_track(self, track_type: str, index: Optional[int] = None) -> Dict[str, Any]:
+        t = str(track_type).strip().lower()
+        if t not in {"midi", "audio"}:
+            raise ValueError("track_type must be 'midi' or 'audio'")
+        payload = {"track_type": t}
+        if index is not None:
+            payload["index"] = int(index)
+        return self._command("ableton_create_track", **payload)
+
     def create_midi_track(self, index: Optional[int] = None) -> Dict[str, Any]:
-        params = {} if index is None else {"index": int(index)}
-        return self._command("create_midi_track", **params)
+        return self.create_track("midi", index=index)
 
     def create_audio_track(self, index: Optional[int] = None) -> Dict[str, Any]:
-        params = {} if index is None else {"index": int(index)}
-        return self._command("create_audio_track", **params)
+        return self.create_track("audio", index=index)
 
-    def delete_track(self, index: int) -> Dict[str, Any]:
-        return self._command("delete_track", index=int(index))
-
-    def duplicate_track(self, index: int) -> Dict[str, Any]:
-        return self._command("duplicate_track", index=int(index))
+    def set_track_level(
+        self,
+        track: int,
+        *,
+        volume: Optional[float] = None,
+        pan: Optional[float] = None,
+        mute: Optional[bool] = None,
+        solo: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"track": int(track)}
+        if volume is not None:
+            payload["volume"] = self._validate_range("volume", float(volume), -60.0, 6.0)
+        if pan is not None:
+            payload["pan"] = self._validate_range("pan", float(pan), -1.0, 1.0)
+        if mute is not None:
+            payload["mute"] = bool(mute)
+        if solo is not None:
+            payload["solo"] = bool(solo)
+        if not payload.keys() - {"track"}:
+            raise ValueError(
+                "set_track_level requires at least one of volume, pan, mute, solo"
+            )
+        return self._command("ableton_set_track_level", **payload)
 
     def mute_track(self, index: int, mute: bool = True) -> Dict[str, Any]:
-        return self._command("mute_track", index=int(index), mute=bool(mute))
+        return self.set_track_level(index, mute=bool(mute))
 
     def solo_track(self, index: int, solo: bool = True) -> Dict[str, Any]:
-        return self._command("solo_track", index=int(index), solo=bool(solo))
+        return self.set_track_level(index, solo=bool(solo))
 
     def set_volume(self, index: int, volume: float) -> Dict[str, Any]:
-        if not -60 <= volume <= 6:
-            raise ValueError("volume in dB must be between -60 and +6")
-        return self._command("set_volume", index=int(index), volume=float(volume))
+        return self.set_track_level(index, volume=float(volume))
 
     def set_pan(self, index: int, pan: float) -> Dict[str, Any]:
-        if not -1 <= pan <= 1:
-            raise ValueError("pan must be between -1 (left) and 1 (right)")
-        return self._command("set_pan", index=int(index), pan=float(pan))
+        return self.set_track_level(index, pan=float(pan))
 
-    def set_send(self, index: int, send: int, value: float) -> Dict[str, Any]:
-        if not 0 <= value <= 1:
-            raise ValueError("send value must be between 0 and 1")
-        return self._command("set_send", index=int(index), send=int(send), value=float(value))
-
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     #  Clips
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     def create_midi_clip(self, track: int, length_beats: float = 4.0,
                          scene: Optional[int] = None) -> Dict[str, Any]:
-        params = {"track": int(track), "length_beats": float(length_beats)}
+        payload = {
+            "track": int(track),
+            "length_beats": self._validate_range("length_beats", float(length_beats), 0.001,
+                                                  10_000.0),
+        }
         if scene is not None:
-            params["scene"] = int(scene)
-        return self._command("create_midi_clip", **params)
+            payload["scene"] = int(scene)
+        return self._command("ableton_create_clip", **payload)
 
-    def set_clip_length(self, track: int, clip: int, length_beats: float) -> Dict[str, Any]:
-        return self._command("set_clip_length", track=int(track), clip=int(clip),
-                             length_beats=float(length_beats))
+    def replace_clip_notes(
+        self,
+        track: int,
+        clip: int,
+        notes: Sequence[Any],
+        *,
+        confirm: bool = True,
+    ) -> Dict[str, Any]:
+        payload = {
+            "track": int(track),
+            "clip": int(clip),
+            "notes": self._validate_note_list(notes),
+            "confirm": bool(confirm),
+        }
+        return self._command("ableton_replace_clip_notes", **payload)
 
-    def add_note(self, track: int, clip: int, pitch: int, start: float,
-                 duration: float, velocity: int = 100) -> Dict[str, Any]:
-        if not 0 <= pitch <= 127:
-            raise ValueError("pitch must be 0-127")
-        if not 0 <= velocity <= 127:
-            raise ValueError("velocity must be 0-127")
-        return self._command("add_note", track=int(track), clip=int(clip),
-                             pitch=int(pitch), start=float(start),
-                             duration=float(duration), velocity=int(velocity))
+    def remove_clip_note(
+        self,
+        track: int,
+        clip: int,
+        pitch: int,
+        start: float,
+        *,
+        confirm: bool = True,
+    ) -> Dict[str, Any]:
+        pitch_val = int(self._validate_range("pitch", float(pitch), 0.0, 127.0))
+        if float(pitch_val) != float(pitch):
+            raise ValueError("pitch must be an integer")
+        payload = {
+            "track": int(track),
+            "clip": int(clip),
+            "pitch": pitch_val,
+            "start": self._validate_range("start", float(start), 0.0, 10_000.0),
+            "confirm": bool(confirm),
+        }
+        return self._command("ableton_remove_clip_note", **payload)
 
-    def add_notes(self, track: int, clip: int,
-                  notes: Sequence[Tuple[int, float, float, int]]) -> Dict[str, Any]:
-        """Add many notes at once. Each note is (pitch, start, duration, velocity)."""
-        clean = []
-        for n in notes:
-            if len(n) < 4:
-                raise ValueError("each note must be (pitch, start, duration, velocity)")
-            pitch, start, duration, velocity = n[0], n[1], n[2], n[3]
-            if not 0 <= pitch <= 127:
-                raise ValueError(f"pitch {pitch} out of range 0-127")
-            if not 0 <= velocity <= 127:
-                raise ValueError(f"velocity {velocity} out of range 0-127")
-            clean.append({"pitch": int(pitch), "start": float(start),
-                          "duration": float(duration), "velocity": int(velocity)})
-        return self._command("add_notes", track=int(track), clip=int(clip), notes=clean)
-
-    def remove_note(self, track: int, clip: int, pitch: int, start: float) -> Dict[str, Any]:
-        return self._command("remove_note", track=int(track), clip=int(clip),
-                             pitch=int(pitch), start=float(start))
-
-    def clear_clip(self, track: int, clip: int) -> Dict[str, Any]:
-        return self._command("clear_clip", track=int(track), clip=int(clip))
-
-    def quantize_clip(self, track: int, clip: int, grid: int = 4) -> Dict[str, Any]:
-        """grid is notes-per-beat (4 = 1/16)."""
-        return self._command("quantize_clip", track=int(track), clip=int(clip), grid=int(grid))
+    def set_clip_loop(self, track: int, clip: int, loop: bool) -> Dict[str, Any]:
+        return self._command("ableton_set_clip_loop", track=int(track), clip=int(clip), loop=bool(loop))
 
     def toggle_clip_loop(self, track: int, clip: int) -> Dict[str, Any]:
-        return self._command("toggle_clip_loop", track=int(track), clip=int(clip))
+        return self._command("ableton_toggle_clip_loop", track=int(track), clip=int(clip))
 
-    # ------------------------------------------------------------------ #
-    #  Browser
-    # ------------------------------------------------------------------ #
-    def load_instrument(self, track: int, name: str) -> Dict[str, Any]:
-        return self._command("load_instrument", track=int(track), name=str(name))
+    def launch_clip(self, track: int, clip: int) -> Dict[str, Any]:
+        return self._command("ableton_launch_clip", track=int(track), clip=int(clip))
 
-    def load_effect(self, track: int, name: str) -> Dict[str, Any]:
-        return self._command("load_effect", track=int(track), name=str(name))
+    def clear_clip(self, track: int, clip: int, confirm: bool = True) -> Dict[str, Any]:
+        return self._command("ableton_clear_clip", track=int(track), clip=int(clip),
+                             confirm=bool(confirm))
 
-    def load_sample(self, track: int, name: str) -> Dict[str, Any]:
-        return self._command("load_sample", track=int(track), name=str(name))
+    def stop_clip(self, track: int, clip: int) -> Dict[str, Any]:
+        return self._command("ableton_stop_clip", track=int(track), clip=int(clip))
 
-    def load_drum_rack(self, track: int, name: str = "") -> Dict[str, Any]:
-        return self._command("load_drum_rack", track=int(track), name=str(name))
-
-    # ------------------------------------------------------------------ #
-    #  Devices
-    # ------------------------------------------------------------------ #
-    def set_device_parameter(self, track: int, device: int, param: int,
-                              value: float) -> Dict[str, Any]:
-        if not 0 <= value <= 1:
-            raise ValueError("device parameter value must be 0-1")
-        return self._command("set_device_parameter", track=int(track), device=int(device),
-                             param=int(param), value=float(value))
-
-    def get_device_parameters(self, track: int, device: int) -> Dict[str, Any]:
-        return self._command("get_device_parameters", track=int(track), device=int(device))
-
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     #  Scenes
-    # ------------------------------------------------------------------ #
-    def create_scene(self, name: str = "") -> Dict[str, Any]:
-        return self._command("create_scene", name=str(name))
-
+    # ------------------------------------------------------------------
     def launch_scene(self, scene: int) -> Dict[str, Any]:
-        return self._command("launch_scene", scene=int(scene))
+        return self._command("ableton_launch_scene", scene=int(scene))
 
-    def reorder_scene(self, scene: int, new_index: int) -> Dict[str, Any]:
-        return self._command("reorder_scene", scene=int(scene), new_index=int(new_index))
+    # ------------------------------------------------------------------
+    #  Scheduling / performance flow
+    # ------------------------------------------------------------------
+    def schedule_plan(
+        self,
+        tracks: Iterable[Dict[str, Any]],
+        *,
+        alignment: str = "next_bar",
+        preview: bool = False,
+        confirm: bool = False,
+        plan_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        normalized_tracks: List[Dict[str, Any]] = []
+        for track_payload in tracks:
+            if not isinstance(track_payload, dict):
+                raise ValueError("tracks must be a list of objects")
+            normalized_tracks.append({
+                "track": int(track_payload["track"]),
+                "clip": int(track_payload["clip"]),
+                "notes": self._validate_note_list(track_payload.get("notes", [])),
+            })
+        payload = {
+            "alignment": str(alignment).strip().lower(),
+            "tracks": normalized_tracks,
+            "preview": bool(preview),
+            "confirm": bool(confirm),
+        }
+        if plan_id is not None:
+            payload["plan_id"] = str(plan_id)
+        return self._command("ableton_schedule_plan", mode="queue", **payload,
+                             idempotency_key=idempotency_key)
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     #  State
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     def get_state(self) -> Dict[str, Any]:
-        """Return last known state cached on the bridge (no round-trip to Ableton)."""
         return self._get("/state")
 
+    def ableton_status(self, *, fresh: bool = False) -> Dict[str, Any]:
+        return self._command("ableton_status", mode="query", fresh=bool(fresh))
+
     def get_full_state(self) -> Dict[str, Any]:
-        """Ask Ableton to report its full current state (round-trip command)."""
-        return self._command("get_full_state")
+        return self.ableton_status(fresh=True)
 
-    def request_state_refresh(self) -> Dict[str, Any]:
-        """Trigger a fresh state report from Ableton."""
-        return self.get_full_state()
+    # ------------------------------------------------------------------
+    #  Legacy methods intentionally removed from v1 toolset
+    # ------------------------------------------------------------------
+    def delete_track(self, *_, **__):
+        raise AbletonError("delete_track is not in v1 toolset. Use deterministic schedule or explicit policy.")
+
+    def duplicate_track(self, *_, **__):
+        raise AbletonError("duplicate_track is not in v1 toolset.")
+
+    def toggle_metronome(self, *_, **__):
+        raise AbletonError("toggle_metronome is not in v1 toolset.")
+
+    def add_note(self, *_, **__):
+        raise AbletonError("add_note is retired. Use replace_clip_notes(notes=[...]).")
+
+    def add_notes(self, *_, **__):
+        raise AbletonError("add_notes is retired. Use replace_clip_notes(notes=[...]).")
+
+    def quantize_clip(self, *_, **__):
+        raise AbletonError("quantize_clip is not in v1 toolset.")
+
+    def set_send(self, *_, **__):
+        raise AbletonError("set_send is not in v1 toolset.")
+
+    def set_device_parameter(self, *_, **__):
+        raise AbletonError("set_device_parameter is not in v1 toolset.")
+
+    def get_device_parameters(self, *_, **__):
+        raise AbletonError("get_device_parameters is not in v1 toolset.")
+
+    def create_scene(self, *_, **__):
+        raise AbletonError("create_scene is not in v1 toolset.")
+
+    def reorder_scene(self, *_, **__):
+        raise AbletonError("reorder_scene is not in v1 toolset.")
+
+    def load_instrument(self, *_, **__):
+        raise AbletonError("load_instrument is not in v1 toolset.")
+
+    def load_effect(self, *_, **__):
+        raise AbletonError("load_effect is not in v1 toolset.")
+
+    def load_sample(self, *_, **__):
+        raise AbletonError("load_sample is not in v1 toolset.")
+
+    def load_drum_rack(self, *_, **__):
+        raise AbletonError("load_drum_rack is not in v1 toolset.")
 
 
-# Make the module runnable as a quick CLI smoke test:
-#   python -m hermes.ableton_api play
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     import sys
+    import pprint
+
     c = AbletonClient()
     action = sys.argv[1] if len(sys.argv) > 1 else "status"
     method = getattr(c, action, None)
     if method is None:
         print(f"unknown action: {action}")
         sys.exit(1)
-    import pprint
-    pprint.pprint(method())
+    if action == "replace_clip_notes":
+        # basic smoke test entry
+        # Usage: python -m hermes.ableton_api replace_clip_notes <track> <clip>
+        track = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+        clip = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+        result = method(track, clip, [])
+        pprint.pprint(result)
+    else:
+        result = method()
+        pprint.pprint(result)

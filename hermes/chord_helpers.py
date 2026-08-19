@@ -222,7 +222,7 @@ def create_chord_progression(client, track: int, key: str,
         for pitch in chord:
             notes.append((pitch, t, beats_per_chord * 0.95, 95))
         t += beats_per_chord
-    client.add_notes(track=track, clip=clip_index, notes=notes)
+    client.replace_clip_notes(track=track, clip=clip_index, notes=notes)
     return {"key": key, "progression": progression_type, "bpm": bpm,
             "chords": len(prog), "clip_length_beats": total_beats}
 
@@ -252,7 +252,7 @@ def create_drum_pattern(client, track: int, pattern_name: str = "four-on-floor",
         for step, note, vel in steps:
             start = bar_offset + step * 0.25  # 16th = 0.25 beat
             notes.append((note, start, 0.25, vel))
-    client.add_notes(track=track, clip=clip_index, notes=notes)
+    client.replace_clip_notes(track=track, clip=clip_index, notes=notes)
     return {"pattern": pattern_name, "bpm": bpm, "bars": bars,
             "notes": len(notes)}
 
@@ -288,6 +288,6 @@ def create_scale_melody(client, track: int, key: str, scale: str = "major",
         # step up/down the scale, sometimes leap
         step = rng.choice([-2, -1, -1, 1, 1, 2]) if rng.random() < 0.8 else rng.choice([-3, 3])
         idx = max(0, min(len(pool) - 1, idx + step))
-    client.add_notes(track=track, clip=clip_index, notes=notes)
+    client.replace_clip_notes(track=track, clip=clip_index, notes=notes)
     return {"key": key, "scale": scale, "bpm": bpm, "num_notes": num_notes,
             "notes": notes}

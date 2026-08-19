@@ -9,10 +9,12 @@
 #   BRIDGE_STATE_INTERVAL
 
 # VPS WebSocket server (the bridge connects here as a client)
-vps_host: "177.7.34.85"
-vps_port: 8443
-auth_token: "change-me-please"     # MUST match the server's auth_token
-use_ssl: false                      # set true if the VPS uses wss://
+# Runtime values are injected via environment variables or overrides; never ship
+# placeholder credentials in production.
+vps_host: "oasis-untrimmed-verbose.ngrok-free.dev"
+vps_port: 443
+auth_token: ""                     # must be set via env/CLI in production
+use_ssl: true
 
 # AbletonOSC (Max for Live device inside Ableton)
 osc_host: "127.0.0.1"              # AbletonOSC runs on localhost

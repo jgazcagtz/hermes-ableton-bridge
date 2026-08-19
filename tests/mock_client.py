@@ -52,6 +52,8 @@ class FakeAbleton:
         self.metronome = False
         self.overdub_on = False
         self.time_signature = (4, 4)
+        self._beat_position = 0.0
+        self._beat_clock = time.time()
         self.tracks = [
             {"index": 0, "name": "1 MIDI", "type": "midi", "volume": 0.0,
              "pan": 0.0, "mute": False, "solo": False, "sends": [0.0, 0.0],
@@ -60,6 +62,17 @@ class FakeAbleton:
         self.scenes = [{"index": 0, "name": "Scene 1"}]
 
     # -- helpers --
+    def _tick(self) -> None:
+        now = time.time()
+        if self.playing:
+            delta = max(0.0, now - self._beat_clock)
+            self._beat_position += (delta / 60.0) * float(self.tempo)
+        self._beat_clock = now
+
+    def _set_playing(self, on: bool) -> None:
+        self._tick()
+        self.playing = bool(on)
+
     def _track(self, index):
         for t in self.tracks:
             if t["index"] == index:
@@ -67,12 +80,14 @@ class FakeAbleton:
         raise IndexError(f"no track at index {index}")
 
     def full_state(self):
+        self._tick()
         return {
             "tempo": self.tempo,
             "playing": self.playing,
             "loop": self.loop_on,
             "metronome": self.metronome,
             "overdub": self.overdub_on,
+            "beat_position": self._beat_position,
             "time_signature": list(self.time_signature),
             "tracks": self.tracks,
             "scenes": self.scenes,
@@ -86,14 +101,22 @@ class FakeAbleton:
         return fn(params) or {}
 
     # Transport
-    def cmd_play(self, p): self.playing = True; return {"playing": True}
-    def cmd_stop(self, p): self.playing = False; return {"playing": False}
+    def cmd_play(self, p):
+        self._set_playing(True)
+        return {"playing": True}
+
+    def cmd_stop(self, p):
+        self._set_playing(False)
+        return {"playing": False}
     def cmd_set_tempo(self, p):
         self.tempo = float(p["tempo"]); return {"tempo": self.tempo}
     def cmd_set_time_signature(self, p):
         self.time_signature = (int(p["numerator"]), int(p["denominator"]))
         return {"time_signature": list(self.time_signature)}
     def cmd_toggle_loop(self, p): self.loop_on = not self.loop_on; return {"loop": self.loop_on}
+    def cmd_set_loop(self, p):
+        self.loop_on = bool(p.get("on", not self.loop_on))
+        return {"loop": self.loop_on}
     def cmd_toggle_metronome(self, p): self.metronome = not self.metronome; return {"metronome": self.metronome}
     def cmd_overdub(self, p):
         self.overdub_on = bool(p.get("on", not self.overdub_on)); return {"overdub": self.overdub_on}
@@ -167,6 +190,18 @@ class FakeAbleton:
         c["notes"] = [n for n in c["notes"]
                       if not (n["pitch"] == int(p["pitch"]) and abs(n["start"] - float(p["start"])) < 1e-6)]
         return {"notes": len(c["notes"])}
+    def cmd_replace_clip_notes(self, p):
+        t = self._track(int(p["track"])); c = t["clips"][int(p["clip"])]
+        c["notes"] = [
+            {
+                "pitch": int(n["pitch"]),
+                "start": float(n["start"]),
+                "duration": float(n["duration"]),
+                "velocity": int(n["velocity"]),
+            }
+            for n in p.get("notes", [])
+        ]
+        return {"replaced": len(c["notes"])}
     def cmd_clear_clip(self, p):
         t = self._track(int(p["track"])); c = t["clips"][int(p["clip"])]
         c["notes"] = []; return {"cleared": True}
